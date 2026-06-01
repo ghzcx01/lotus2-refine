@@ -1,0 +1,397 @@
+Lotus-2 Replica Refiner 修改说明
+================================
+
+时间范围
+--------
+本文总结今天早上围绕 Replica depth refiner 做的改动。核心目标是：
+
+1. dataloader 读取 Replica 里的 pred depth。
+2. 训练时把 pred 作为额外输入提供给模型。
+3. 让模型从“单张 RGB 预测 depth”变成“RGB + 初始 depth pred -> refined depth”。
+4. 给 finetuning.py 增加 rgb/rgbd 输入模式选项。
+5. 修正 refine_replica.sh，让 pred/gt 都按 inverse depth 逻辑训练。
+
+
+一、改动文件概览
+----------------
+
+主要改了三个文件：
+
+1. dataloader/replica.py
+   - Manifest 支持可选 pred 字段。
+   - 普通 paired dataset 支持 --train_pred_dir。
+   - Replica dataset 原本已经能找到 replica/pred/0.5 下的 pred，现在确认并保留为 batch["pred"]。
+   - collate_fn 会把 pred stack 成 batch["pred"]。
+
+2. finetuning.py
+   - 新增 --input_mode，支持 rgb 和 rgbd。
+   - 新增 --train_pred_dir，用于非 Replica 数据集时提供 pred depth。
+   - rgbd 模式下要求 task_name=depth，并要求每个 sample 都有 pred。
+   - 新增 RGBD token 拼接逻辑，把 pred latent 当作 query，把 RGB latent 当作额外 context。
+   - 训练、eval、可视化推理三条路径都接入了相同的 RGBD 输入逻辑。
+
+3. refine_replica.sh
+   - 开启 --input_mode=rgbd。
+   - 把 --depth_normalization 从 minmax 改成 trunc_disparity。
+   - 输出目录改成 outputs/refiner_replica_disp。
+   - SLURM job/log 名改成 refiner，避免和普通 depth finetune 混淆。
+
+
+二、dataloader 中 pred 的来源和格式
+-----------------------------------
+
+Replica 数据结构按当前代码约定为：
+
+- RGB:
+  replica/rgb/{scale}/rgb_{frame_id}_{view_id}.png
+
+- GT depth:
+  replica/gt/{scale}/depth_{frame_id}_{view_id}.npy
+
+- 初始预测 pred:
+  replica/pred/{scale}/{frame_id}/depth_stitched_{stitched_index}.npy
+
+在 Replica 中只使用 view_id 0 和 3，并映射到 stitched index：
+
+- view 0 -> depth_stitched_0.npy
+- view 3 -> depth_stitched_1.npy
+
+build_replica_records(args) 会为每个样本保存：
+
+- rgb
+- gt
+- pred
+- target = gt
+- frame_id
+- view_id
+
+ReplicaGeometryDataset.__getitem__ 会同时加载：
+
+- rgb: 输入图像
+- gt: 训练目标
+- pred: 初始 depth 预测
+
+然后统一做 resize/crop/flip。这样可以保证 rgb、gt、pred、mask 的空间尺寸完全对齐。
+
+普通 paired dataset 也补充了 pred 支持：
+
+- 如果用 manifest，可以在 jsonl/csv 里加 pred 字段。
+- 如果用目录，可以传 --train_pred_dir，文件 stem 需要和 RGB stem 对齐。
+
+
+三、pred 是否转换成 inverse depth
+---------------------------------
+
+pred 和 gt 会走同一个 _load_target()，因此二者的归一化方式完全一致。
+
+当前 refine_replica.sh 已改为：
+
+--depth_normalization=trunc_disparity
+
+这意味着对于 depth task：
+
+1. 读取原始 depth 数值。
+2. 过滤无效值，例如非有限值、<= depth_min 的值，以及可选 depth_max 之外的值。
+3. 转成 disparity/inverse depth：
+
+   disparity = 1.0 / depth
+
+4. 用 depth_trunc_quantile 做上下分位截断，默认 q=0.02。
+5. 把截断后的 disparity min/max 归一化到 [0, 1]。
+6. 再映射到模型图像空间 [-1, 1]，并复制成 3 通道。
+
+所以在 refine_replica.sh 当前配置下：
+
+- gt 是 normalized inverse depth。
+- pred 也是 normalized inverse depth。
+- 模型学习的是在 inverse depth/disparity 空间里 refine pred 到 gt。
+
+如果使用 --depth_normalization=minmax，则 pred 不会变成 inverse depth，只是普通 depth min-max 归一化。这个选项已经从 refine_replica.sh 里改掉。
+
+
+四、Lotus-2 / Flux 在这里的大致工作原理
+---------------------------------------
+
+Lotus-2 当前训练脚本基于 FLUX transformer。它不是直接在 RGB pixel 上做卷积回归，而是先把图像形式的数据编码到 VAE latent，再让 transformer 在 latent token 上工作。
+
+整体可以理解为：
+
+RGB or depth image
+  -> VAE encoder
+  -> latent feature map
+  -> pack 成 token sequence
+  -> FluxTransformer2DModel
+  -> output token sequence
+  -> unpack 回 latent feature map
+  -> VAE decoder 可视化成 image-like depth
+
+更具体一点：
+
+1. VAE encode
+   finetuning.py 里的 encode_latents() 会把输入的 rgb/target/pred 从 [-1, 1] 图像空间编码成 VAE latent。
+
+2. pack_latents
+   FLUX 的 transformer 接收的是 token sequence，不是普通 BCHW feature map。
+   Lotus2Pipeline._pack_latents 会把 latent feature map 打包成形状类似：
+
+   [batch, num_tokens, token_channels]
+
+   每个 token 表示 latent 空间里一个 patch 的信息。
+
+3. img_ids
+   latent_image_ids() 会生成每个 image token 的坐标 ID。FLUX 用这些 ID 做 rotary positional embedding，让 transformer 知道每个 token 在二维 latent grid 里的位置。
+
+4. text prompt
+   pipeline.encode_prompt() 生成 prompt_embeds、pooled_prompt_embeds、text_ids。
+   当前训练里 prompt 通常是空字符串，但 FLUX 结构仍然需要这些 text/context embeddings。
+
+5. Flux transformer
+   FluxTransformer2DModel 内部先用 x_embedder 把 image tokens 投影到 transformer hidden dim。
+   同时用 context_embedder 处理 text tokens。
+   前半部分 transformer blocks 会联合处理 text tokens 和 image tokens。
+   后半部分 single transformer blocks 会处理拼接后的序列。
+   最后 proj_out 输出和输入 image token 数量相同的 token sequence。
+
+关键限制：
+
+Flux 的 x_embedder 期望每个 image token 的 channel 数固定，例如当前模型 config.in_channels。不能简单把 RGB latent 和 pred latent 在 channel 维 concat，因为那会让 token_channels 变成两倍，和预训练 FLUX 的输入线性层不匹配。
+
+因此这次没有做 channel concat，而是做 token concat。
+
+
+五、RGB 模式和 RGBD 模式的区别
+------------------------------
+
+新增参数：
+
+--input_mode rgb
+--input_mode rgbd
+
+默认是 rgb，保持旧行为。
+
+1. rgb 模式
+
+原始 Lotus-2 训练逻辑基本是：
+
+rgb
+  -> VAE latent
+  -> pack rgb latent tokens
+  -> core_predictor LoRA
+  -> predicted target latent
+  -> local continuity module
+  -> detail_sharpener LoRA
+  -> refined target latent
+
+这里模型从 RGB 单独预测 depth。
+
+2. rgbd 模式
+
+新的 refiner 逻辑是：
+
+rgb
+  -> VAE latent
+  -> packed_rgb_latents
+
+pred depth
+  -> VAE latent
+  -> packed_pred_latents
+
+然后构造 transformer 输入：
+
+[pred tokens, rgb tokens]
+
+其中 pred tokens 是 query，即模型真正要 refine 的对象。
+RGB tokens 是额外视觉条件/context，让模型在修 pred 时能看 RGB 图像。
+
+Transformer 输出的 token 数和输入 token 数相同，因此输出也是：
+
+[output_for_pred_tokens, output_for_rgb_tokens]
+
+训练代码只取前半段：
+
+core_pred_packed = core_pred_packed[:, :core_query_token_count]
+
+也就是说，只有 pred query 对应的输出会被 unpack 成 refined depth latent，并参与 loss。
+
+
+六、为什么 img_ids 要一起拼接
+------------------------------
+
+FLUX 不只看 token 的数值，还需要每个 token 的位置 ID，也就是 img_ids。
+
+rgbd 模式下，输入 token 从原来的：
+
+[pred tokens]
+
+变成：
+
+[pred tokens, rgb tokens]
+
+因此 img_ids 也要同步变成两份：
+
+[pred token ids, rgb token ids]
+
+这次新增的 prepare_packed_model_input() 做了这件事：
+
+1. query_ids = image_ids.clone()
+2. rgb_ids = image_ids.clone()
+3. query_ids[:, 0] = 0
+4. rgb_ids[:, 0] = 1
+5. packed_latents = cat([query_packed_latents, rgb_context_packed_latents], dim=1)
+6. packed_image_ids = cat([query_ids, rgb_ids], dim=0)
+
+这里把 img_ids 的第 0 维当作一个简单的 modality/layer 区分：
+
+- 0 表示 pred query plane
+- 1 表示 RGB context plane
+
+这样 pred token 和 RGB token 即使二维坐标相同，也不会拥有完全相同的位置 ID。
+
+
+七、训练 loss 的变化
+-------------------
+
+target 仍然是 gt latent。
+
+core loss：
+
+core_pred_latents vs target_latents
+
+detail loss：
+
+detail_pred_velocity vs detail_target_velocity
+
+主要区别是 source_latents 的来源变了：
+
+- rgb 模式：source 来自 RGB 预测出的 depth latent。
+- rgbd 模式：source 来自 pred depth query 在 RGB context 条件下 refine 后的 latent。
+
+mask 仍然由 gt_mask 和 pred_mask 相乘得到：
+
+target_mask = gt_mask * pred_mask
+
+因此 pred 无效的位置不会参与有效训练区域。
+
+
+八、训练、评估、可视化都已接入 RGBD
+----------------------------------
+
+本次不是只改了 training loop，还同步改了三个路径：
+
+1. 训练路径
+   main() 里的 batch loop 会读取 batch["pred"]，编码成 pred_latents，并走 RGBD token 拼接。
+
+2. eval 路径
+   _compute_eval_losses() 也读取 batch["pred"]，保证 eval loss 和 train loss 用同一套输入逻辑。
+
+3. 可视化路径
+   predict_depth_images() 会用 batch["pred"] 做 refiner 输入。
+   save_depth_visualizations() 也会在可视化面板里加入 input pred depth，方便看：
+
+   RGB | input pred depth | gt depth | output depth
+
+
+九、refine_replica.sh 当前配置
+-----------------------------
+
+当前脚本的关键参数：
+
+PYTHON=/home/chenxiz/.conda/envs/lotus2/bin/python
+OUTPUT_DIR=outputs/refiner_replica_disp
+
+finetuning.py 参数：
+
+--task_name=depth
+--replica_root=replica
+--replica_scale=0.5
+--crop_mode=original
+--depth_normalization=trunc_disparity
+--input_mode=rgbd
+--num_train_epochs=50
+--train_batch_size=1
+--mixed_precision=bf16
+--gradient_checkpointing
+
+Replica 模式不需要 --train_pred_dir，因为 build_replica_records() 会自动从 replica/pred/{scale}/... 找 pred。
+
+
+十、验证过的内容
+----------------
+
+已经做过以下检查：
+
+1. Python 语法检查
+
+/home/chenxiz/.conda/envs/lotus2/bin/python -m py_compile dataloader/replica.py finetuning.py
+
+结果：通过。
+
+2. 模块导入检查
+
+import dataloader.replica, finetuning
+
+结果：通过。
+
+3. 参数解析检查
+
+--input_mode=rgbd 可以正确解析。
+refine_replica.sh 当前对应解析结果：
+
+input_mode = rgbd
+depth_normalization = trunc_disparity
+train_stage = both
+output_dir = outputs/refiner_replica_disp
+
+4. dataloader 抽样检查
+
+Replica batch 中已经包含：
+
+- batch["rgb"]
+- batch["target"]
+- batch["pred"]
+- batch["mask"]
+
+抽样形状：
+
+rgb:    [1, 3, 512, 1024]
+target: [1, 3, 512, 1024]
+pred:   [1, 3, 512, 1024]
+mask:   [1, 1, 512, 1024]
+
+5. RGBD token 拼接检查
+
+prepare_packed_model_input() 会把 token 数从 N 扩展到 2N：
+
+[batch, N, C] -> [batch, 2N, C]
+
+img_ids 也从 N 扩展到 2N，并用第 0 维区分 pred/RGB 两组 token。
+
+6. refine_replica.sh shell 语法检查
+
+bash -n refine_replica.sh
+
+结果：通过。
+
+
+十一、后续注意点
+----------------
+
+1. rgbd 模式目前只允许 depth task。
+   normal task 没有接 pred depth refiner 逻辑。
+
+2. 如果后续不用 Replica，而是自己的 paired 数据，需要提供 pred：
+   - manifest 中加 pred 字段，或
+   - 使用 --train_pred_dir。
+
+3. 如果要训练 inverse depth refiner，保持：
+
+   --depth_normalization=trunc_disparity
+
+   不要改回 minmax。
+
+4. 当前实现没有改 FLUX 模型结构，也没有改输入 projection 权重。
+   这是有意的：通过 token concat 复用原始 FLUX x_embedder，避免破坏预训练权重形状。
+
+5. 由于 rgbd 模式 token 数翻倍，transformer attention 的显存和速度会比 rgb 模式更重。
+   当前 refine_replica.sh 已开启 --gradient_checkpointing 来缓解显存压力。
+

@@ -1,0 +1,42 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+
+# Local IDE/session files
+.vscode/
+.DS_Store
+.gradio/
+vibe_edit_history/
+
+# Original upstream docs not used by this refine repo
+README.md
+
+# Data and benchmark downloads
+data/
+datasets/
+replica/
+dsine_eval/
+*.npy
+*.npz
+
+# Model weights, checkpoints, and downloaded caches
+ckpts/
+checkpoint*/
+checkpoints/
+checkpoint-*/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.tar
+
+# Training/eval outputs
+output/
+outputs/
+
+# SLURM and run logs
+slurmlog/
+slurm-*.out
+*.log
+*.err
